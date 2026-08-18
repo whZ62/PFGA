@@ -1,2 +1,0 @@
-"""PFGA test package."""
-
