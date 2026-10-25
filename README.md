@@ -19,18 +19,6 @@ python -m pip install -e ".[dev]"
 The implementation uses native PyTorch scatter operations and does not require
 PyTorch Geometric.
 
-## Smoke test
-
-Create three synthetic monthly batches and run a short experiment:
-
-```bash
-python scripts/create_toy_data.py --output data/toy
-pfga-train --config configs/toy.yaml
-python -m pytest
-```
-
-Expected artifacts are written to `outputs/toy/`, including `best.pt`, `last.pt`,
-`history.jsonl`, and `summary.json`.
 
 ## Paper experiments
 
