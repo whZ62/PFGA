@@ -3,27 +3,6 @@
 Official-style release implementation of **Personalized Fair Graph Assigner (PFGA)**
 for personalized and fairness-aware task assignment in spatial crowdsourcing.
 
-The package follows Algorithm 1 and Equations (1)-(23) of the accompanying paper:
-
-> *Antibody-Enhanced Fairness Adaptation for Personalized Task Assignment in
-> Spatial Crowdsourcing*.
-
-## What is included
-
-- dynamic fairness-antibody memory with exponential smoothing (Eq. 1-3);
-- gated worker encoder and independent task encoder (Eq. 4-7);
-- residual multi-head social attention (Eq. 8-9);
-- sparse feasible candidate graph materialization (Eq. 17-23);
-- edge-only assignment prediction and the composite loss (Eq. 10, 12-16);
-- adaptive-threshold, capacity-aware constrained greedy assignment (Eq. 11);
-- chronological monthly training, validation, testing, checkpoints, and metrics;
-- configurations for the exact paper time splits on Yelp and Foursquare;
-- a deterministic toy-data path for installation checks.
-
-The precise implementation decisions needed to make several ambiguous paper formulas
-executable are disclosed in [docs/PAPER_ALIGNMENT.md](docs/PAPER_ALIGNMENT.md).
-The supplied prototype audit is also summarized in Chinese in
-[AUDIT_REPORT_ZH.md](AUDIT_REPORT_ZH.md).
 
 ## Installation
 
