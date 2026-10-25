@@ -1,0 +1,40 @@
+{
+  "source_manuscript": "WWW revision (6), 2026-10-25",
+  "test_environment": {
+    "python": "3.12",
+    "torch": "2.14.1+cpu",
+    "device": "CPU"
+  },
+  "pytest": "26 passed",
+  "ruff": "passed",
+  "compileall": "passed",
+  "python_3_9_ast_syntax": "passed (not a Python 3.9 runtime execution)",
+  "toy_ablation_variants": [
+    "deficit_score",
+    "full",
+    "joint_score",
+    "memory_score",
+    "state_concat",
+    "without_antibody_injection",
+    "without_cost_loss",
+    "without_fairness_loss",
+    "without_fairness_memory",
+    "without_graph_materialization",
+    "without_prediction_loss",
+    "without_social_aggregation",
+    "without_utility_loss"
+  ],
+  "seed_aggregation": {
+    "seeds": [
+      "1",
+      "2"
+    ],
+    "std": "sample ddof=1"
+  },
+  "fairness_weight_sensitivity_values": [
+    "0.0",
+    "1.0"
+  ],
+  "plot_summary_endpoint_check": "passed",
+  "data": "synthetic toy only; no real Foursquare/Yelp benchmarks were supplied"
+}

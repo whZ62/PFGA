@@ -7,9 +7,6 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from pfga.config import LossSection
-from pfga.data import MonthlyBatch
-
 
 def gini_coefficient(income: Tensor, epsilon: float = 1e-8) -> Tensor:
     """Differentiable sorted-form Gini coefficient in O(m log m)."""
@@ -25,11 +22,9 @@ def gini_coefficient(income: Tensor, epsilon: float = 1e-8) -> Tensor:
         return total * 0.0
     sorted_income = torch.sort(income).values
     n = sorted_income.numel()
-    rank = torch.arange(
-        1, n + 1, dtype=sorted_income.dtype, device=sorted_income.device
-    )
+    rank = torch.arange(1, n + 1, dtype=sorted_income.dtype, device=sorted_income.device)
     numerator = torch.sum((2.0 * rank - n - 1.0) * sorted_income)
-    return (numerator / (n * total + epsilon)).clamp(0.0, 1.0)
+    return (numerator / (n * total + n * n * epsilon)).clamp(0.0, 1.0)
 
 
 @dataclass
@@ -52,65 +47,55 @@ class LossBreakdown:
         }
 
 
-def _reduce(values: Tensor, reduction: str) -> Tensor:
-    return values.mean() if reduction == "mean" else values.sum()
+def soft_allocation(logits, batch, edges, threshold):
+    """Eq17. Hard threshold mask has stop-gradient; retained weights are differentiable."""
+    p = torch.sigmoid(logits)
+    p = p * (p >= threshold).to(p.dtype)
+    task_sum = torch.zeros(batch.num_tasks, device=p.device).index_add(0, edges[1], p)
+    a = p / (1 + task_sum[edges[1]])
+    worker_sum = torch.zeros(batch.num_workers, device=p.device).index_add(0, edges[0], a)
+    scale = (batch.worker_capacity / (worker_sum + 1e-8)).clamp(max=1)
+    return a * scale[edges[0]]
 
 
 def composite_loss(
-    logits: Tensor,
-    labels: Tensor,
-    batch: MonthlyBatch,
-    edge_index: Tensor,
-    config: LossSection,
-) -> LossBreakdown:
-    """Compute Eq. (12)-(16) on sparse candidate edges."""
-
-    labels = labels.to(dtype=logits.dtype)
-    positive_count = labels.sum()
-    negative_count = labels.numel() - positive_count
-    if positive_count.detach().item() > 0:
-        positive_weight = (negative_count / positive_count).clamp_min(1.0)
+    logits,
+    labels,
+    batch,
+    edge_index,
+    config,
+    historical_utility=None,
+    threshold=0.4,
+    prediction_logits=None,
+    prediction_labels=None,
+):
+    """Eq16-22; supervision edges are independent of policy candidate pruning."""
+    pred = logits if prediction_logits is None else prediction_logits
+    y = labels if prediction_labels is None else prediction_labels
+    y = y.to(pred.dtype)
+    pos, neg = y.sum(), (1 - y).sum()
+    # Single-class/empty batches have a finite unweighted fallback.
+    weight = neg / pos if pos.item() > 0 and neg.item() > 0 else pred.new_tensor(1.0)
+    if pred.numel():
+        prediction = F.binary_cross_entropy_with_logits(
+            pred, y, pos_weight=weight, reduction="sum"
+        ) / (weight * pos + neg).clamp_min(1)
     else:
-        positive_weight = torch.ones((), dtype=logits.dtype, device=logits.device)
-    prediction = F.binary_cross_entropy_with_logits(
-        logits,
-        labels,
-        pos_weight=positive_weight,
-        reduction="mean",
+        prediction = pred.sum() * 0
+    mass = soft_allocation(logits, batch, edge_index, threshold)
+    utility = -(mass * batch.edge_benefit(edge_index)).sum() / batch.num_tasks
+    cost = (mass * batch.edge_cost(edge_index) / batch.distance_scale_km).sum() / batch.num_tasks
+    if historical_utility is None:
+        history = torch.zeros(batch.num_workers, device=logits.device)
+    else:
+        history = historical_utility.detach().clone()
+    # Global worker population, including inactive / zero-allocation workers.
+    ids = batch.worker_ids[edge_index[0]] if historical_utility is not None else edge_index[0]
+    income = history.index_add(0, ids, mass * batch.edge_benefit(edge_index))
+    fairness = gini_coefficient(income)
+    total = config.lambda_p * prediction + (1 - config.lambda_p) * (
+        config.utility_weight * utility
+        + config.cost_weight * cost
+        + config.fairness_weight * fairness
     )
-
-    probabilities = torch.sigmoid(logits)
-    raw_utility = batch.edge_benefit(edge_index)
-    raw_cost = batch.edge_cost(edge_index)
-    utility = raw_utility
-    cost = raw_cost
-    if config.normalize_utility:
-        utility = utility / utility.detach().max().clamp_min(1e-8)
-    if config.normalize_cost:
-        cost = cost / cost.detach().max().clamp_min(1e-8)
-
-    utility_loss = -_reduce(probabilities * utility, config.reduction)
-    cost_loss = _reduce(probabilities * cost, config.reduction)
-
-    worker_income = torch.zeros(
-        batch.num_workers,
-        dtype=probabilities.dtype,
-        device=probabilities.device,
-    )
-    worker_income.index_add_(0, edge_index[0], probabilities * raw_utility)
-    fairness_loss = gini_coefficient(worker_income)
-
-    allocation_objectives = (
-        config.utility_weight * utility_loss
-        + config.cost_weight * cost_loss
-        + config.fairness_weight * fairness_loss
-    )
-    total = config.lambda_p * prediction + (1.0 - config.lambda_p) * allocation_objectives
-    return LossBreakdown(
-        total=total,
-        prediction=prediction,
-        utility=utility_loss,
-        cost=cost_loss,
-        fairness=fairness_loss,
-        positive_weight=positive_weight,
-    )
+    return LossBreakdown(total, prediction, utility, cost, fairness, weight)

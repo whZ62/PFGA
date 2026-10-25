@@ -1,84 +1,105 @@
-"""Chronological training, isolated validation, checkpointing, and test evaluation."""
+"""Chronological optimization and frozen-parameter validation/test replay."""
 
 import json
 import logging
 import math
 import time
 from pathlib import Path
-from statistics import mean
-from typing import Dict, Iterable, List, Tuple
-
 import torch
-
 from pfga.assignment import constrained_greedy_assignment
 from pfga.candidates import CandidateGraphMaterializer
-from pfga.config import PFGAConfig
-from pfga.data import (
-    MonthlyBatch,
-    infer_global_num_workers,
-    load_periods,
-    validate_feature_dimensions,
-)
+from pfga.data import load_periods, _torch_load
 from pfga.losses import composite_loss
-from pfga.metrics import evaluate_assignment
+from pfga.metrics import ReplayMetrics
 from pfga.model import PFGA
+from pfga.replay import StreamData
 from pfga.reproducibility import environment_metadata, resolve_device, seed_everything
-
 
 LOGGER = logging.getLogger(__name__)
 
 
-def _json_dump(path: Path, value: object) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+def dump(path, obj):
+    path.write_text(json.dumps(obj, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
-def _torch_load(path: Path, device: torch.device) -> object:
-    try:
-        return torch.load(path, map_location=device, weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location=device)
+class LegacyData:
+    """Explicit compatibility adapter. No claim of chronological mobility replay."""
+
+    def __init__(self, batches, config):
+        self.batches = batches
+        self.config = config
+        self.num_workers = max(int(x.worker_ids.max()) for x in batches) + 1
+        self.worker_dim = batches[0].worker_features.shape[1]
+        self.task_dim = batches[0].task_features.shape[1]
+
+    def replay(self):
+        return LegacyReplay(self)
 
 
-def _average_numeric(records: Iterable[Dict[str, object]]) -> Dict[str, object]:
-    records = list(records)
-    if not records:
-        return {}
-    result: Dict[str, object] = {}
-    keys = set().union(*(record.keys() for record in records))
-    for key in sorted(keys):
-        values = [record[key] for record in records if key in record]
-        numeric = [
-            float(value)
-            for value in values
-            if isinstance(value, (int, float)) and not isinstance(value, bool)
+class LegacyReplay:
+    def __init__(self, data):
+        self.data = data
+        self.it = iter(data.batches)
+        self.batch = None
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        b = next(self.it)
+        gen = torch.Generator().manual_seed(self.data.config.data.sampling_seed)
+        e = b.feasible_edge_index
+        y = b.labels_for_edges(e)
+        pos = e[:, y == 1]
+        neg = e[:, y == 0]
+        neg = neg[
+            :,
+            torch.randperm(neg.shape[1], generator=gen)[
+                : self.data.config.data.negative_ratio * pos.shape[1]
+            ],
         ]
-        if len(numeric) == len(values):
-            result[key] = mean(numeric)
-        elif key == "auc_scope":
-            result[key] = sorted(set(str(value) for value in values))
-    return result
+        b.supervision_edge_index = torch.cat((pos, neg), 1)
+        b.reference_opportunities = torch.bincount(e[0], minlength=b.num_workers).float()
+        b.distance_scale_km = self.data.config.evaluation.distance_scale_km
+        if b.task_rewards is None:
+            raise ValueError(
+                "Legacy upgrade needs explicit task_rewards; do not infer from utility"
+            )
+        self.batch = b
+        self.new_tasks = [{"reward": float(x)} for x in b.task_rewards]
+        return b
+
+    def prediction_batch(self):
+        return self.batch
+
+    def accept(self, i, j):
+        return True
 
 
 class PFGATrainer:
-    def __init__(
-        self,
-        config: PFGAConfig,
-        train_batches: List[MonthlyBatch],
-        validation_batches: List[MonthlyBatch],
-        test_batches: List[MonthlyBatch],
-    ):
+    def __init__(self, config, train_batches, validation_batches, test_batches):
         self.config = config
-        self.train_batches = train_batches
-        self.validation_batches = validation_batches
-        self.test_batches = test_batches
+        sources = [train_batches, validation_batches, test_batches]
+        self.train_data, self.val_data, self.test_data = [
+            LegacyData(x, config) if isinstance(x, list) else x for x in sources
+        ]
+        if (
+            len(
+                {
+                    (x.worker_dim, x.task_dim)
+                    for x in (self.train_data, self.val_data, self.test_data)
+                }
+            )
+            != 1
+        ):
+            raise ValueError("Feature dimensions differ across splits")
+        self.num_workers = max(
+            x.num_workers for x in (self.train_data, self.val_data, self.test_data)
+        )
         self.device = resolve_device(config.experiment.device)
-        worker_dim, task_dim = validate_feature_dimensions(
-            (train_batches, validation_batches, test_batches)
-        )
-        num_workers = infer_global_num_workers(
-            (train_batches, validation_batches, test_batches)
-        )
-        self.model = PFGA(worker_dim, task_dim, num_workers, config.model).to(self.device)
+        self.model = PFGA(
+            self.train_data.worker_dim, self.train_data.task_dim, self.num_workers, config.model
+        ).to(self.device)
         self.materializer = CandidateGraphMaterializer(config.candidates)
         self.optimizer = torch.optim.Adam(
             self.model.parameters(),
@@ -94,181 +115,207 @@ class PFGATrainer:
         )
         self.output = Path(config.training.output_directory)
         self.output.mkdir(parents=True, exist_ok=True)
-        self.history_path = self.output / "history.jsonl"
-        self.history_path.write_text("", encoding="utf-8")
 
-    def _train_batch(self, cpu_batch: MonthlyBatch) -> Dict[str, float]:
-        batch = cpu_batch.to(self.device)
-        self.model.train()
-        self.optimizer.zero_grad(set_to_none=True)
-        candidate = self.materializer(
-            batch, self.model.fairness_memory.cumulative_utility
-        )
-        logits = self.model(batch, candidate.edge_index)
-        labels = batch.labels_for_edges(candidate.edge_index)
-        losses = composite_loss(
-            logits, labels, batch, candidate.edge_index, self.config.loss
-        )
-        if not torch.isfinite(losses.total):
-            raise FloatingPointError(f"{batch.period}: non-finite training loss")
-        losses.total.backward()
-        torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(), self.config.training.gradient_clip_norm
-        )
-        self.optimizer.step()
-        with torch.no_grad():
-            self.model.update_fairness_memory(
-                batch, candidate.edge_index, torch.sigmoid(logits)
-            )
-        record = losses.scalars()
-        record.update(
-            {
-                "candidate_recall": candidate.positive_recall,
-                "candidate_edges": float(candidate.edge_index.shape[1]),
-            }
-        )
-        return record
+    def sync(self):
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
 
-    @torch.no_grad()
-    def _evaluate_split(
-        self,
-        batches: List[MonthlyBatch],
-        isolate_memory: bool,
-    ) -> Tuple[Dict[str, object], List[Dict[str, object]]]:
-        snapshot = self.model.fairness_memory.snapshot() if isolate_memory else None
-        self.model.eval()
-        period_records: List[Dict[str, object]] = []
-        try:
-            for cpu_batch in batches:
-                batch = cpu_batch.to(self.device)
+    def replay(self, data, training=False):
+        # Defined split protocol: fresh zero fairness states and common train-based locations.
+        self.model.fairness_memory.reset()
+        self.model.train(training)
+        tracker = ReplayMetrics(self.num_workers)
+        rows = []
+        loss_sum = 0.0
+        steps = 0
+        stream = data.replay()
+        for cpu in stream:
+            b = cpu.to(self.device)
+            ref = stream.prediction_batch().to(self.device)
+            self.model.fairness_memory.begin_step(b.worker_ids)
+            if training:
+                self.optimizer.zero_grad(set_to_none=True)
+            with torch.set_grad_enabled(training):
+                self.sync()
                 start = time.perf_counter()
-                candidate = self.materializer(
-                    batch, self.model.fairness_memory.cumulative_utility
-                )
-                logits = self.model(batch, candidate.edge_index)
-                assignment = constrained_greedy_assignment(
-                    batch, candidate.edge_index, logits, self.config.assignment
-                )
+                candidate = self.materializer(b, self.model.fairness_memory.cumulative_utility)
+                logits = self.model(b, candidate.edge_index)
+                with torch.no_grad():
+                    assignment = constrained_greedy_assignment(
+                        b,
+                        candidate.edge_index,
+                        logits,
+                        self.config.assignment,
+                        accept=stream.accept,
+                    )
+                self.sync()
                 elapsed = time.perf_counter() - start
-                labels = batch.labels_for_edges(candidate.edge_index)
+                # Fixed reference samples are scored even when policy-pruned or busy.
+                pred = self.model(ref, ref.supervision_edge_index)
+                y = ref.labels_for_edges(ref.supervision_edge_index)
                 losses = composite_loss(
-                    logits, labels, batch, candidate.edge_index, self.config.loss
+                    logits,
+                    b.labels_for_edges(candidate.edge_index),
+                    b,
+                    candidate.edge_index,
+                    self.config.loss,
+                    historical_utility=self.model.fairness_memory.cumulative_utility,
+                    threshold=self.config.assignment.threshold_base,
+                    prediction_logits=pred,
+                    prediction_labels=y,
                 )
-                metrics = evaluate_assignment(
-                    batch=batch,
-                    candidate_edge_index=candidate.edge_index,
-                    logits=logits,
-                    assignment=assignment,
-                    candidate_recall=candidate.positive_recall,
-                    inference_seconds=elapsed,
-                    cost_unit_km=self.config.evaluation.cost_unit_km,
-                    dense_auc_pair_limit=self.config.evaluation.dense_auc_pair_limit,
+                if not torch.isfinite(losses.total):
+                    raise FloatingPointError("Nonfinite loss")
+                if training:
+                    losses.total.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.config.training.gradient_clip_norm
+                    )
+                    self.optimizer.step()
+            self.model.update_fairness_memory(b, assignment.edge_index)
+            tracker.add(
+                b,
+                assignment,
+                y,
+                torch.sigmoid(pred),
+                [x["reward"] for x in stream.new_tasks],
+                elapsed,
+            )
+            loss_sum += float(losses.total.detach())
+            steps += 1
+            if not training:
+                row = tracker.result(self.config.assignment.threshold_base, with_predictions=False)
+                row.update(
+                    {
+                        "decision_step": steps,
+                        "timestamp_hours": getattr(stream, "time", None),
+                        "candidate_edges": candidate.edge_index.shape[1],
+                        "candidate_positive_recall": candidate.positive_recall,
+                    }
                 )
-                metrics.update(losses.scalars())
-                period_records.append(metrics)
-                self.model.update_fairness_memory(
-                    batch, candidate.edge_index, torch.sigmoid(logits)
+                rows.append(row)
+            if steps % 100 == 0:
+                LOGGER.info(
+                    "%s step=%d released=%d assigned=%d",
+                    "train" if training else "eval",
+                    steps,
+                    tracker.released,
+                    tracker.assigned,
                 )
-        finally:
-            if snapshot is not None:
-                self.model.fairness_memory.restore(snapshot)
-        return _average_numeric(period_records), period_records
+        summary = tracker.result(self.config.assignment.threshold_base)
+        summary["loss"] = loss_sum / max(steps, 1)
+        summary["decision_steps"] = steps
+        if self.config.data.mode == "legacy_monthly":
+            summary["protocol"] = "legacy_static_months_NOT_paper_event_replay"
+        return summary, rows, tracker
 
-    def _save_checkpoint(self, path: Path, epoch: int, best_auc: float) -> None:
+    def checkpoint(self, path, epoch, best_auc):
+        # Store parameters with zero runtime state, so inference cannot inherit a previous split.
+        snapshot = self.model.fairness_memory.snapshot()
+        self.model.fairness_memory.reset()
         torch.save(
             {
                 "epoch": epoch,
                 "best_validation_auc": best_auc,
                 "model": self.model.state_dict(),
-                "optimizer": self.optimizer.state_dict(),
-                "scheduler": self.scheduler.state_dict(),
                 "config": self.config.to_dict(),
+                "optimizer": self.optimizer.state_dict(),
             },
             path,
         )
+        self.model.fairness_memory.restore(snapshot)
 
-    def _append_history(self, record: Dict[str, object]) -> None:
-        with self.history_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(record, sort_keys=True) + "\n")
-
-    def train(self) -> Dict[str, object]:
-        _json_dump(self.output / "config.resolved.json", self.config.to_dict())
-        _json_dump(self.output / "environment.json", environment_metadata())
-        best_auc = -math.inf
+    def train(self):
+        dump(self.output / "config.resolved.json", self.config.to_dict())
+        dump(self.output / "environment.json", environment_metadata())
+        best = -math.inf
         best_epoch = 0
-
-        for epoch in range(1, self.config.training.epochs + 1):
-            batch_records = [self._train_batch(batch) for batch in self.train_batches]
-            train_summary = _average_numeric(batch_records)
-            validation_summary, validation_periods = self._evaluate_split(
-                self.validation_batches, isolate_memory=True
-            )
-            validation_loss = float(validation_summary["loss"])
-            validation_auc = float(validation_summary["auc"])
-            self.scheduler.step(validation_loss)
-
-            history_record: Dict[str, object] = {
-                "epoch": epoch,
-                "learning_rate": self.optimizer.param_groups[0]["lr"],
-                "train": train_summary,
-                "validation": validation_summary,
-                "validation_periods": validation_periods,
-            }
-            self._append_history(history_record)
-            self._save_checkpoint(self.output / "last.pt", epoch, best_auc)
-            if validation_auc > best_auc:
-                best_auc = validation_auc
-                best_epoch = epoch
-                self._save_checkpoint(self.output / "best.pt", epoch, best_auc)
-
-            LOGGER.info(
-                "epoch=%d train_loss=%.5f val_loss=%.5f val_auc=%.5f",
-                epoch,
-                float(train_summary["loss"]),
-                validation_loss,
-                validation_auc,
-            )
-
-        best_checkpoint = _torch_load(self.output / "best.pt", self.device)
-        if not isinstance(best_checkpoint, dict) or "model" not in best_checkpoint:
-            raise ValueError("Invalid best checkpoint")
+        with (self.output / "history.jsonl").open("w", encoding="utf-8") as history:
+            for epoch in range(1, self.config.training.epochs + 1):
+                tr, _, _ = self.replay(self.train_data, True)
+                val, _, _ = self.replay(self.val_data)
+                self.scheduler.step(val["loss"])
+                # Undefined AUC must not masquerade as .5; fall back explicitly to validation loss.
+                value = val["auc"] if val["auc"] is not None else -val["loss"]
+                if value > best:
+                    best = value
+                    best_epoch = epoch
+                    self.checkpoint(self.output / "best.pt", epoch, val["auc"])
+                self.checkpoint(self.output / "last.pt", epoch, val["auc"])
+                history.write(json.dumps({"epoch": epoch, "train": tr, "validation": val}) + "\n")
+                history.flush()
+                LOGGER.info(
+                    "epoch=%d/%d train_loss=%.5f val_auc=%s val_utility=%.4f val_fair=%.4f",
+                    epoch,
+                    self.config.training.epochs,
+                    tr["loss"],
+                    val["auc"],
+                    val["utility"],
+                    val["fair"],
+                )
+        best_checkpoint = _torch_load(self.output / "best.pt")
         self.model.load_state_dict(best_checkpoint["model"])
-        test_summary, test_periods = self._evaluate_split(
-            self.test_batches, isolate_memory=False
+        sweep = []
+        for threshold in self.config.assignment.threshold_grid:
+            self.config.assignment.threshold_base = float(threshold)
+            result, _, _ = self.replay(self.val_data)
+            sweep.append(result)
+        if sweep:
+            chosen = max(
+                sweep,
+                key=lambda x: (
+                    x["acc"] if x["acc"] is not None else -math.inf,
+                    x["utility"],
+                    -x["fair"],
+                ),
+            )
+            self.config.assignment.threshold_base = chosen["threshold"]
+        dump(self.output / "validation_thresholds.json", sweep)
+        self.checkpoint(self.output / "best.pt", best_epoch, best_checkpoint["best_validation_auc"])
+        test, rows, tracker = self.replay(self.test_data)
+        dump(self.output / "test_trajectory.json", rows)
+        dump(
+            self.output / "worker_outcomes.json",
+            {
+                "utility": tracker.utility.tolist(),
+                "reward": tracker.rewards.tolist(),
+                "reference_opportunities": tracker.opportunities.tolist(),
+            },
         )
-        summary: Dict[str, object] = {
+        summary = {
             "experiment": self.config.experiment.name,
             "best_epoch": best_epoch,
-            "best_validation_auc": best_auc,
-            "test": test_summary,
-            "test_periods": test_periods,
+            "selected_threshold": self.config.assignment.threshold_base,
+            "test": test,
+            "test_periods": rows,
+            "selection_rule": "validation AUC (loss fallback), threshold by validation ACC",
+            "protocol": "each split starts with zero utility/memory; test parameters frozen",
+            "timing_scope": (
+                "retrieval, model inference and greedy; "
+                "excludes event/feature construction, reference evaluation, loss and backprop"
+            ),
         }
-        _json_dump(self.output / "summary.json", summary)
+        dump(self.output / "summary.json", summary)
+        dump(self.output / "config.resolved.json", self.config.to_dict())
         return summary
 
 
-def load_experiment_data(
-    config: PFGAConfig,
-) -> Tuple[List[MonthlyBatch], List[MonthlyBatch], List[MonthlyBatch]]:
-    strict = config.data.strict_paper_schema
-    directory = config.data.directory
-    train = load_periods(
-        directory, config.data.train.start, config.data.train.end, strict=strict
+def load_experiment_data(config):
+    root = Path(config.data.directory)
+    if config.data.mode == "stream":
+        return tuple(StreamData(root / f"{s}.pt", config) for s in ("train", "validation", "test"))
+    return tuple(
+        load_periods(
+            str(root),
+            getattr(config.data, s).start,
+            getattr(config.data, s).end,
+            config.data.strict_paper_schema,
+        )
+        for s in ("train", "validation", "test")
     )
-    validation = load_periods(
-        directory,
-        config.data.validation.start,
-        config.data.validation.end,
-        strict=strict,
-    )
-    test = load_periods(
-        directory, config.data.test.start, config.data.test.end, strict=strict
-    )
-    return train, validation, test
 
 
-def run_experiment(config: PFGAConfig) -> Dict[str, object]:
+def run_experiment(config):
+    config.validate()
     seed_everything(config.experiment.seed, config.experiment.deterministic)
-    train, validation, test = load_experiment_data(config)
-    trainer = PFGATrainer(config, train, validation, test)
-    return trainer.train()
+    return PFGATrainer(config, *load_experiment_data(config)).train()

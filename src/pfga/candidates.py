@@ -1,4 +1,4 @@
-"""Sparse feasible candidate graph materialization (paper Eq. 17-23)."""
+"""Sparse feasible candidate graph materialization (paper Eq. 23-28)."""
 
 from dataclasses import dataclass
 
@@ -27,19 +27,19 @@ class CandidateGraphMaterializer:
     def __call__(self, batch: MonthlyBatch, historical_utility: Tensor) -> CandidateGraph:
         edges = batch.feasible_edge_index
         if edges.shape[1] == 0:
-            raise ValueError(f"{batch.period}: the feasible graph contains no edges")
+            z = torch.zeros(batch.num_tasks, dtype=torch.long, device=batch.device)
+            return CandidateGraph(edges, torch.empty(0, device=batch.device), z, z.clone(), 0.0)
 
         worker_index, task_index = edges
         edge_cost = batch.edge_cost(edges)
-        maximum_distance = edge_cost.max().clamp_min(1e-8)
+        maximum_distance = batch.distance_scale_km
         normalized_distance = edge_cost / maximum_distance
         preference = batch.preference_matrix[worker_index, task_index]
         slack = batch.slack_matrix[worker_index, task_index]
 
-        local_history = historical_utility[batch.worker_ids]
-        mean_utility = local_history.mean()
-        deficit = (mean_utility - local_history).clamp_min(0.0)
-        deficit = deficit / mean_utility.abs().clamp_min(1e-8)
+        mean_utility = historical_utility.mean()
+        x = (mean_utility - historical_utility[batch.worker_ids]) / (mean_utility + 1e-8)
+        deficit = (x / (1 + x.abs())).clamp_min(0)
 
         scores = (
             self.config.preference_weight * preference

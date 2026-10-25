@@ -30,7 +30,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
     config = load_config(args.config)
     summary = run_experiment(config)
-    print(json.dumps(summary, indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            {k: v for k, v in summary.items() if k != "test_periods"}, indent=2, sort_keys=True
+        )
+    )
 
 
 if __name__ == "__main__":

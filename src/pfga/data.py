@@ -53,6 +53,10 @@ class MonthlyBatch:
     slack_matrix: Tensor
     worker_ids: Tensor
     worker_capacity: Tensor
+    task_rewards: Optional[Tensor] = None
+    supervision_edge_index: Optional[Tensor] = None
+    reference_opportunities: Optional[Tensor] = None
+    distance_scale_km: float = 60.0
 
     @property
     def num_workers(self) -> int:
@@ -77,9 +81,7 @@ class MonthlyBatch:
         """Return binary historical labels for local worker-task edges."""
 
         num_tasks = self.num_tasks
-        positive_linear = (
-            self.positive_edge_index[0] * num_tasks + self.positive_edge_index[1]
-        )
+        positive_linear = self.positive_edge_index[0] * num_tasks + self.positive_edge_index[1]
         query_linear = edge_index[0] * num_tasks + edge_index[1]
         if positive_linear.numel() == 0:
             return torch.zeros(query_linear.shape[0], device=edge_index.device)
@@ -130,6 +132,15 @@ class MonthlyBatch:
             raise ValueError(f"{self.period}: worker_ids must be unique and non-negative")
         if tuple(self.worker_capacity.shape) != (m,):
             raise ValueError(f"{self.period}: worker_capacity must have length {m}")
+        if self.task_rewards is not None:
+            if (
+                self.task_rewards.shape != (n,)
+                or not torch.isfinite(self.task_rewards).all()
+                or (self.task_rewards <= 0).any()
+            ):
+                raise ValueError("task_rewards must be a finite positive vector")
+            if (self.benefit_matrix > self.task_rewards[None, :] + 1e-6).any():
+                raise ValueError("preference utility must not exceed task reward")
         if (self.worker_capacity < 0).any():
             raise ValueError(f"{self.period}: worker_capacity must be non-negative")
 
@@ -189,6 +200,7 @@ def _derive_feasibility_and_slack(
             warnings.warn(
                 "No feasibility fields found; treating all worker-task pairs as feasible.",
                 RuntimeWarning,
+                stacklevel=2,
             )
             feasible_edges = _all_pair_edges(m, n, device)
 
@@ -218,9 +230,7 @@ def adapt_monthly_batch(raw: Any, period: str, strict: bool = True) -> MonthlyBa
     cost_matrix = _read(raw, ("cost_matrix", "distance_matrix"))
     required = (worker_features, task_features, benefit_matrix, cost_matrix)
     if any(value is None for value in required):
-        raise ValueError(
-            f"{period}: worker/task features and benefit/cost matrices are required"
-        )
+        raise ValueError(f"{period}: worker/task features and benefit/cost matrices are required")
 
     workers = torch.as_tensor(worker_features, dtype=torch.float32)
     tasks = torch.as_tensor(task_features, dtype=torch.float32, device=workers.device)
@@ -254,6 +264,7 @@ def adapt_monthly_batch(raw: Any, period: str, strict: bool = True) -> MonthlyBa
         warnings.warn(
             f"{period}: worker_ids missing; assuming stable row order across months.",
             RuntimeWarning,
+            stacklevel=2,
         )
         worker_ids = torch.arange(m, dtype=torch.long, device=workers.device)
     else:
@@ -268,6 +279,11 @@ def adapt_monthly_batch(raw: Any, period: str, strict: bool = True) -> MonthlyBa
     preference = _derive_preference_matrix(raw, m, n, workers.device)
     feasible_edges, slack = _derive_feasibility_and_slack(raw, costs, strict)
 
+    task_rewards = _read(raw, ("task_rewards", "task_reward"))
+    if task_rewards is None and strict:
+        raise ValueError(
+            "New Utility metric requires task_rewards; cannot infer rewards from benefit_matrix"
+        )
     batch = MonthlyBatch(
         period=period,
         worker_features=workers,
@@ -281,6 +297,9 @@ def adapt_monthly_batch(raw: Any, period: str, strict: bool = True) -> MonthlyBa
         slack_matrix=slack,
         worker_ids=worker_ids,
         worker_capacity=worker_capacity,
+        task_rewards=None
+        if task_rewards is None
+        else torch.as_tensor(task_rewards, dtype=torch.float32),
     )
     batch.validate()
     return batch

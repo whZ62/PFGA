@@ -29,7 +29,10 @@ class ExperimentSection:
 
 @dataclass
 class DataSection:
-    directory: str = "data/monthly"
+    directory: str = "data/prepared"
+    mode: str = "stream"
+    negative_ratio: int = 2
+    sampling_seed: int = 2026
     strict_paper_schema: bool = True
     train: DateRange = field(default_factory=lambda: DateRange("2016-01", "2018-12"))
     validation: DateRange = field(default_factory=lambda: DateRange("2019-01", "2019-12"))
@@ -40,7 +43,10 @@ class DataSection:
 class ModelSection:
     hidden_dim: int = 64
     attention_heads: int = 4
-    dropout: float = 0.2
+    dropout: float = 0.0
+    compensation: str = "representation"
+    deficit_score_weight: float = 1.0
+    memory_score_weight: float = 1.0
     antibody_hidden_dim: int = 32
     fairness_gamma: float = 0.9
     use_antibody_injection: bool = True
@@ -64,7 +70,7 @@ class LossSection:
     utility_weight: float = 1.0
     cost_weight: float = 1.0
     fairness_weight: float = 1.0
-    normalize_utility: bool = True
+    normalize_utility: bool = False
     normalize_cost: bool = True
     reduction: str = "mean"
 
@@ -72,8 +78,9 @@ class LossSection:
 @dataclass
 class AssignmentSection:
     threshold_base: float = 0.4
-    threshold_scale: float = 0.1
-    force_assign: bool = True
+    threshold_scale: float = 0.0
+    force_assign: bool = False
+    threshold_grid: tuple = (0.1, 0.2, 0.3, 0.4, 0.5)
 
 
 @dataclass
@@ -89,8 +96,19 @@ class TrainingSection:
 
 
 @dataclass
+class SimulationSection:
+    deadline_hours: float = 12.0
+    availability_hours: float = 12.0
+    speed_kmh: float = 5.0
+    capacity_cap: int = 5
+    reward_min: float = 0.5
+    reward_max: float = 1.5
+
+
+@dataclass
 class EvaluationSection:
-    cost_unit_km: float = 100.0
+    cost_unit_km: float = 1.0
+    distance_scale_km: float = 60.0
     dense_auc_pair_limit: int = 5_000_000
 
 
@@ -104,6 +122,7 @@ class PFGAConfig:
     assignment: AssignmentSection = field(default_factory=AssignmentSection)
     training: TrainingSection = field(default_factory=TrainingSection)
     evaluation: EvaluationSection = field(default_factory=EvaluationSection)
+    simulation: SimulationSection = field(default_factory=SimulationSection)
 
     def validate(self) -> None:
         for name, value in (
@@ -112,6 +131,50 @@ class PFGAConfig:
             ("test", self.data.test),
         ):
             value.validate(name)
+        if (
+            not self.data.train.end < self.data.validation.start
+            or not self.data.validation.end < self.data.test.start
+        ):
+            raise ValueError("train, validation and test must be chronological and disjoint")
+        if self.data.mode not in {"stream", "legacy_monthly"}:
+            raise ValueError("data.mode must be stream or legacy_monthly")
+        if self.data.negative_ratio < 0:
+            raise ValueError("negative_ratio must be nonnegative")
+        if self.model.compensation not in {
+            "representation",
+            "deficit_score",
+            "memory_score",
+            "joint_score",
+            "concat",
+        }:
+            raise ValueError("unknown compensation variant")
+        if self.assignment.force_assign or self.assignment.threshold_scale != 0:
+            raise ValueError(
+                "current manuscript uses fixed validation threshold and no forced assignment"
+            )
+        if not 0 <= self.assignment.threshold_base <= 1 or any(
+            not 0 <= x <= 1 for x in self.assignment.threshold_grid
+        ):
+            raise ValueError("thresholds must be in [0,1]")
+        if self.evaluation.distance_scale_km <= 0 or self.evaluation.cost_unit_km != 1:
+            raise ValueError(
+                "use positive distance_scale_km and report Cost in km (cost_unit_km=1)"
+            )
+        if (
+            self.loss.normalize_utility
+            or not self.loss.normalize_cost
+            or self.loss.reduction != "mean"
+        ):
+            raise ValueError("Eq18 uses raw utility / task count; Eq19 normalizes distance")
+        if (
+            self.simulation.deadline_hours <= 0
+            or not 0 < self.simulation.availability_hours <= 24
+            or self.simulation.speed_kmh <= 0
+            or self.simulation.capacity_cap < 1
+        ):
+            raise ValueError("invalid simulation time / speed / capacity")
+        if not 0 < self.simulation.reward_min <= self.simulation.reward_max:
+            raise ValueError("invalid reward interval")
         if self.model.hidden_dim <= 0:
             raise ValueError("model.hidden_dim must be positive")
         if self.model.attention_heads <= 0:
@@ -159,10 +222,11 @@ def load_config(path: str) -> PFGAConfig:
     data = DataSection(
         directory=data_raw.get("directory", DataSection.directory),
         strict_paper_schema=data_raw.get("strict_paper_schema", True),
+        mode=data_raw.get("mode", "stream"),
+        negative_ratio=data_raw.get("negative_ratio", 2),
+        sampling_seed=data_raw.get("sampling_seed", 2026),
         train=DateRange(**data_raw.get("train", {"start": "2016-01", "end": "2018-12"})),
-        validation=DateRange(
-            **data_raw.get("validation", {"start": "2019-01", "end": "2019-12"})
-        ),
+        validation=DateRange(**data_raw.get("validation", {"start": "2019-01", "end": "2019-12"})),
         test=DateRange(**data_raw.get("test", {"start": "2020-01", "end": "2020-12"})),
     )
     config = PFGAConfig(
@@ -174,6 +238,7 @@ def load_config(path: str) -> PFGAConfig:
         assignment=AssignmentSection(**_section(raw, "assignment")),
         training=TrainingSection(**_section(raw, "training")),
         evaluation=EvaluationSection(**_section(raw, "evaluation")),
+        simulation=SimulationSection(**_section(raw, "simulation")),
     )
     config.validate()
     return config

@@ -17,7 +17,7 @@ def test_assignment_respects_task_and_capacity_constraints() -> None:
     edges = torch.tensor([[0, 0, 1, 2], [0, 1, 0, 1]], dtype=torch.long)
     logits = torch.tensor([4.0, 3.0, 2.0, 1.0])
     result = constrained_greedy_assignment(
-        batch, edges, logits, AssignmentSection(force_assign=True)
+        batch, edges, logits, AssignmentSection(force_assign=False)
     )
     assert torch.unique(result.edge_index[1]).numel() == result.edge_index.shape[1]
     worker_counts = torch.bincount(result.edge_index[0], minlength=batch.num_workers)
@@ -25,12 +25,11 @@ def test_assignment_respects_task_and_capacity_constraints() -> None:
     assert result.unassigned_tasks.numel() == 0
 
 
-def test_force_assign_uses_best_below_threshold_candidate() -> None:
+def test_below_threshold_candidates_remain_unassigned() -> None:
     batch = make_batch()
     edges = torch.tensor([[0, 2], [0, 1]], dtype=torch.long)
     logits = torch.tensor([-10.0, -9.0])
     result = constrained_greedy_assignment(
-        batch, edges, logits, AssignmentSection(force_assign=True)
+        batch, edges, logits, AssignmentSection(force_assign=False)
     )
-    assert result.edge_index.shape[1] == 2
-
+    assert result.edge_index.shape[1] == 0

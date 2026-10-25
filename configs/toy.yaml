@@ -1,0 +1,67 @@
+experiment:
+  name: toy
+  seed: 7
+  device: auto
+  deterministic: true
+data:
+  directory: data/toy_prepared
+  strict_paper_schema: true
+  train:
+    start: 2020-01
+    end: 2020-01
+  validation:
+    start: 2020-02
+    end: 2020-02
+  test:
+    start: 2020-03
+    end: 2020-03
+  mode: stream
+  negative_ratio: 2
+  sampling_seed: 2026
+model:
+  hidden_dim: 16
+  attention_heads: 4
+  dropout: 0.0
+  antibody_hidden_dim: 8
+  fairness_gamma: 0.9
+  use_antibody_injection: true
+  use_fairness_memory: true
+  use_social_aggregation: true
+candidates:
+  enabled: true
+  top_k: 4
+  preference_weight: 1.0
+  distance_weight: 0.5
+  fairness_weight: 0.5
+  slack_weight: 0.1
+loss:
+  lambda_p: 0.7
+  utility_weight: 1.0
+  cost_weight: 1.0
+  fairness_weight: 1.0
+  normalize_utility: false
+  normalize_cost: true
+  reduction: mean
+assignment:
+  threshold_base: 0.4
+  threshold_scale: 0.0
+  force_assign: false
+  threshold_grid:
+  - 0.1
+  - 0.2
+  - 0.3
+  - 0.4
+  - 0.5
+training:
+  epochs: 5
+  learning_rate: 0.01
+  weight_decay: 0.0
+  gradient_clip_norm: 5.0
+  scheduler_patience: 2
+  scheduler_factor: 0.5
+  minimum_learning_rate: 1.0e-05
+  output_directory: outputs/toy
+evaluation:
+  cost_unit_km: 1.0
+  dense_auc_pair_limit: 100000
+  distance_scale_km: 60.0

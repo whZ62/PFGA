@@ -1,4 +1,3 @@
-"""Personalized Fair Graph Assigner (PFGA)."""
+"""PFGA current-manuscript implementation."""
 
-__version__ = "1.0.0"
-
+__version__ = "2.0.0"

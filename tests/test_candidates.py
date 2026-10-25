@@ -34,4 +34,3 @@ def test_fairness_deficit_changes_ranking() -> None:
     history = torch.tensor([0.0, 2.0, 3.0])
     candidate = CandidateGraphMaterializer(config)(batch, history)
     assert set(candidate.edge_index[0].tolist()) == {0}
-

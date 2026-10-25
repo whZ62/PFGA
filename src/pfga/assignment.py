@@ -1,4 +1,4 @@
-"""Adaptive-threshold, feasibility-preserving constrained greedy assignment."""
+"""Fixed-threshold greedy allocation. Replay validates updated travel schedules."""
 
 import math
 from dataclasses import dataclass
@@ -17,7 +17,7 @@ def adaptive_threshold(
     base: float = 0.4,
     scale: float = 0.1,
 ) -> float:
-    """Paper Eq. (11): tau_t = base + scale * tanh(1 - n/m)."""
+    """Legacy helper only; not used by the current manuscript allocation."""
 
     if num_workers <= 0:
         raise ValueError("num_workers must be positive")
@@ -37,23 +37,13 @@ def constrained_greedy_assignment(
     candidate_edge_index: Tensor,
     logits: Tensor,
     config: AssignmentSection,
+    accept=None,
 ) -> AssignmentResult:
-    """Select at most one feasible worker per task under worker capacities.
-
-    Edges above the adaptive threshold are considered first. When `force_assign` is
-    enabled, remaining tasks receive their best capacity-feasible candidate even when
-    it falls below the threshold. Exact-one assignment is impossible when a task has no
-    retained feasible candidate or when aggregate worker capacity is insufficient; such
-    tasks are returned explicitly.
-    """
-
+    """Fixed validation threshold; callback rechecks current mobility constraints."""
+    if config.force_assign or config.threshold_scale != 0:
+        raise ValueError("Use fixed threshold without forced assignment for Eq14")
     probabilities = torch.sigmoid(logits)
-    threshold = adaptive_threshold(
-        batch.num_workers,
-        batch.num_tasks,
-        base=config.threshold_base,
-        scale=config.threshold_scale,
-    )
+    threshold = config.threshold_base
     worker_cpu = candidate_edge_index[0].detach().cpu().tolist()
     task_cpu = candidate_edge_index[1].detach().cpu().tolist()
     probability_cpu = probabilities.detach().cpu().tolist()
@@ -74,24 +64,11 @@ def constrained_greedy_assignment(
             continue
         if task in assigned_tasks or used[worker] >= capacity[worker]:
             continue
+        if accept is not None and not accept(worker, task):
+            continue
         selected.append(index)
         assigned_tasks.add(task)
         used[worker] += 1
-
-    if config.force_assign:
-        for task in range(batch.num_tasks):
-            if task in assigned_tasks:
-                continue
-            for index in ranked:
-                if task_cpu[index] != task:
-                    continue
-                worker = worker_cpu[index]
-                if used[worker] >= capacity[worker]:
-                    continue
-                selected.append(index)
-                assigned_tasks.add(task)
-                used[worker] += 1
-                break
 
     if selected:
         selected_tensor = torch.tensor(
@@ -100,9 +77,7 @@ def constrained_greedy_assignment(
         assigned_edges = candidate_edge_index[:, selected_tensor]
         assigned_probabilities = probabilities[selected_tensor]
     else:
-        assigned_edges = torch.empty(
-            (2, 0), dtype=torch.long, device=candidate_edge_index.device
-        )
+        assigned_edges = torch.empty((2, 0), dtype=torch.long, device=candidate_edge_index.device)
         assigned_probabilities = torch.empty(
             (0,), dtype=probabilities.dtype, device=probabilities.device
         )

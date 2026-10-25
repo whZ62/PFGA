@@ -8,9 +8,7 @@ from tests.helpers import make_batch
 def test_gini_known_values() -> None:
     assert torch.isclose(gini_coefficient(torch.ones(3)), torch.tensor(0.0))
     expected = torch.tensor(2.0 / 3.0)
-    assert torch.isclose(
-        gini_coefficient(torch.tensor([0.0, 0.0, 1.0])), expected, atol=1e-6
-    )
+    assert torch.isclose(gini_coefficient(torch.tensor([0.0, 0.0, 1.0])), expected, atol=1e-6)
 
 
 def test_composite_loss_is_finite_and_differentiable() -> None:
@@ -23,4 +21,3 @@ def test_composite_loss_is_finite_and_differentiable() -> None:
     loss.total.backward()
     assert logits.grad is not None
     assert torch.isfinite(logits.grad).all()
-
